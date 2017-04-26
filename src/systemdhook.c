@@ -81,7 +81,7 @@ DEFINE_CLEANUP_FUNC(yajl_val, yajl_tree_free)
 #define pr_pdebug(fmt, ...) syslog(LOG_DEBUG, "systemdhook <debug>: " fmt "\n", ##__VA_ARGS__)
 
 #define BUFLEN 1024
-#define CONFIGSZ 65536
+#define CHUNKSIZE 4096
 
 #define CGROUP_ROOT "/sys/fs/cgroup"
 #define CGROUP_SYSTEMD CGROUP_ROOT"/systemd"
@@ -638,33 +638,113 @@ static int poststop(const char *rootfs,
 	return ret;
 }
 
+/*
+ * Read the entire content of stream pointed to by 'from' into a buffer in memory.
+ * Return a pointer to the resulting NULL-terminated string.
+ */
+char *getJSONstring(FILE *from, size_t chunksize, char *msg)
+{
+	struct stat stat_buf;
+	char *err = NULL, *JSONstring = NULL;
+	size_t nbytes, bufsize;
+
+	if (fstat(fileno(from), &stat_buf) == -1) {
+		err = "fstat failed";
+		goto fail;
+	}
+
+	if (S_ISREG(stat_buf.st_mode)) {
+		/*
+		 * If 'from' is a regular file, allocate a buffer based
+		 * on the file size and read the entire content with a
+		 * single fread() call.
+		 */
+		if (stat_buf.st_size == 0) {
+			err = "is empty";
+			goto fail;
+		}
+
+		bufsize = (size_t)stat_buf.st_size;
+
+		JSONstring = (char *)malloc(bufsize + 1);
+		if (JSONstring == NULL) {
+			err = "failed to allocate buffer";
+			goto fail;
+		}
+
+		nbytes = fread((void *)JSONstring, 1, (size_t)bufsize, from);
+		if (nbytes != (size_t)bufsize) {
+			err = "error encountered on read";
+			goto fail;
+		}
+	} else {
+		/*
+		 * If 'from' is not a regular file, call fread() iteratively
+		 * to read sections of 'chunksize' bytes until EOF is reached.
+		 * Call realloc() during each iteration to expand the buffer
+		 * as needed.
+		 */
+		bufsize = 0;
+
+		for (;;) {
+			JSONstring = (char *)realloc((void *)JSONstring, bufsize + chunksize);
+			if (JSONstring == NULL) {
+				err = "failed to allocate buffer";
+				goto fail;
+			}
+
+			nbytes = fread((void *)&JSONstring[bufsize], 1, (size_t)chunksize, from);
+			bufsize += nbytes;
+
+			if (nbytes != (size_t)chunksize) {
+				if (ferror(from)) {
+					err = "error encountered on read";
+					goto fail;
+				}
+				if (feof(from))
+					break;
+			}
+		}
+
+		if (bufsize == 0) {
+			err = "is empty";
+			goto fail;
+		}
+
+		JSONstring = (char *)realloc((void *)JSONstring, bufsize + 1);
+		if (JSONstring == NULL) {
+			err = "failed to allocate buffer";
+			goto fail;
+		}
+	}
+
+	/* make sure the string is NULL-terminated */
+	JSONstring[bufsize] = 0;
+	return JSONstring;
+fail:
+	free(JSONstring);
+	pr_perror("%s: %s", msg, err);
+	return NULL;
+}
+
 int main(int argc, char *argv[])
 {
-	size_t rd;
 	_cleanup_(yajl_tree_freep) yajl_val node = NULL;
 	_cleanup_(yajl_tree_freep) yajl_val config_node = NULL;
 	char errbuf[BUFLEN];
-	char stateData[CONFIGSZ];
-	char config_file_name[PATH_MAX];
+	char *stateData;
 	char *configData;
-	off_t configData_size;
-	struct stat configData_stat;
+	char config_file_name[PATH_MAX];
 	_cleanup_fclose_ FILE *fp = NULL;
 
-	memset(stateData, 0, CONFIGSZ);
-	memset(errbuf, 0, BUFLEN);
-
-	/* Read the entire config file from stdin */
-	rd = fread((void *)stateData, 1, sizeof(stateData) - 1, stdin);
-	if (rd == 0 && !feof(stdin)) {
-		pr_perror("Error encountered on file read");
+	/* Read the entire state from stdin */
+	snprintf(errbuf, BUFLEN, "failed to read state data from standard input");
+	stateData = getJSONstring(stdin, (size_t)CHUNKSIZE, errbuf);
+	if (stateData == NULL)
 		return EXIT_FAILURE;
-	} else if (rd >= sizeof(stateData) - 1) {
-		pr_perror("Config file too big");
-		return EXIT_FAILURE;
-	}
 
 	/* Parse the state */
+	memset(errbuf, 0, BUFLEN);
 	node = yajl_tree_parse((const char *)stateData, errbuf, sizeof(errbuf));
 	if (node == NULL) {
 		pr_perror("parse_error: ");
@@ -701,8 +781,7 @@ int main(int argc, char *argv[])
 	}
 	char *id = YAJL_GET_STRING(v_id);
 
-	/* bundle_path must be specified for the OCI hooks, and from there we read the configuration file.
-	   If it is not specified, then check that it is specified on the command line.  */
+	/* 'bundlePath' must be specified for the OCI hooks, and from there we read the configuration file */
 	const char *bundle_path[] = { "bundlePath", (const char *)0 };
 	yajl_val v_bundle_path = yajl_tree_get(node, bundle_path, yajl_t_string);
 	if (v_bundle_path) {
@@ -713,38 +792,19 @@ int main(int argc, char *argv[])
 		snprintf(config_file_name, PATH_MAX, "%s", msg);
 	}
 
-	/* Parse the config file */
-
 	if (fp == NULL) {
 		pr_perror("Failed to open config file: %s", config_file_name);
 		return EXIT_FAILURE;
 	}
 
-	if (fstat(fileno(fp), &configData_stat) == -1) {
-		pr_perror("Failed to determine size of config file: %s", config_file_name);
+	/* Read the entire config file */
+	snprintf(errbuf, BUFLEN, "failed to read config data from %s", config_file_name);
+	configData = getJSONstring(fp, (size_t)CHUNKSIZE, errbuf);
+	if (configData == NULL)
 		return EXIT_FAILURE;
-	}
-	if (configData_stat.st_size == 0) {
-		pr_perror("config file %s is empty", config_file_name);
-		return EXIT_FAILURE;
-	}
-	configData_size = configData_stat.st_size;
 
-	configData = (char *)malloc((size_t)configData_size+1);
-	if (configData == NULL) {
-		pr_perror("Failed to allocate buffer for config data: size=%ld", configData_size+1);
-		return EXIT_FAILURE;
-	}
-
-	rd = fread((void *)configData, 1, (size_t)configData_size, fp);
-	if (rd != (size_t)configData_size) {
-		pr_perror("error encountered on config file read");
-		return EXIT_FAILURE;
-	}
-
-	pr_pdebug("parse %ld bytes of config data from file %s", configData_size, config_file_name);
-
-	configData[configData_size] = 0; /* make sure the JSON string is NULL-terminated */
+	/* Parse the config file */
+	memset(errbuf, 0, BUFLEN);
 	config_node = yajl_tree_parse((const char *)configData, errbuf, sizeof(errbuf));
 	if (config_node == NULL) {
 		pr_perror("parse_error: ");
