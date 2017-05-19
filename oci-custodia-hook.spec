@@ -1,21 +1,12 @@
-%global provider        github
-%global provider_tld    com
-%global project         projectatomic
-%global repo            oci-custodia-hook
-# https://github.com/projectatomic/oci-register-machine
-%global provider_prefix %{provider}.%{provider_tld}/%{project}/%{repo}
-%global import_path     %{provider_prefix}
-%global commit          de345df3c18a6abfc8d9cf3822405c0e1bbe65c9
-%global shortcommit     %(c=%{commit}; echo ${c:0:7})
 
 Name:           oci-custodia-hook
 Version:        0.1.4
-Release:        1.git%{shortcommit}%{?dist}
+Release:        1%{?dist}
 Summary:        OCI custodia hook for docker
 Group:          Applications/Text
 License:        GPLv3+
-URL:            https://%{provider_prefix}
-Source0:        https://%{provider_prefix}/archive/%{commit}/%{repo}-%{shortcommit}.tar.gz
+URL:            https://www.adelton.com/%{name}/
+Source0:        https://www.adelton.com/%{name}/%{name}-%{version}.tar.gz
 
 BuildRequires:  autoconf
 BuildRequires:  automake
@@ -28,7 +19,7 @@ BuildRequires:  golang-github-cpuguy83-go-md2man
 OCI custodia hook bind mounts custodia socket to containers.
 
 %prep
-%setup -q -n %{repo}-%{commit}
+%setup -q
 
 %build
 autoreconf -i
