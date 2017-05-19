@@ -24,5 +24,5 @@ rpm: dist
 clean-local:
 	-rm -f oci-systemd-hook.1 *~
 	-rm -f oci-systemd-hook-*.tar.gz
-	-rm -f oci-sytemd-hook-*.rpm
+	-rm -f oci-systemd-hook-*.rpm
 
